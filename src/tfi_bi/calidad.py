@@ -40,10 +40,12 @@ def validar_capa_curada(d: dict) -> pd.DataFrame:
     return pd.DataFrame(checks, columns=["control", "ok"])
 
 
-def exportar_curado(d: dict, carpeta: Path, estudiantes: pd.DataFrame | None = None) -> None:
-    """Escribe cada tabla como Parquet (Snappy, sin índice)."""
+def exportar_curado(d: dict, carpeta: Path, estudiantes: pd.DataFrame | None = None, firma: str | None = None) -> None:
+    """Escribe cada tabla como Parquet (Snappy, sin índice) y la huella de los Excel de origen."""
     carpeta.mkdir(exist_ok=True)
     for k, df in d.items():
         df.to_parquet(carpeta / f"{k}.parquet", compression="snappy", index=False)
     if estudiantes is not None:
         estudiantes.to_parquet(carpeta / "estudiantes_curado.parquet", compression="snappy", index=False)
+    if firma is not None:
+        (carpeta / "firma_datos.txt").write_text(firma)

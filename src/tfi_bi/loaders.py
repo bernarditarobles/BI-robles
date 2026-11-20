@@ -8,6 +8,7 @@ Principios (los pidió el profe):
 """
 from __future__ import annotations
 
+import hashlib
 import html
 import re
 import warnings
@@ -184,6 +185,14 @@ def cargar_calificaciones(path: Path, materia: str) -> pd.DataFrame:
 
 
 # ----------------------------------------------------------------- orquestador
+def firma_datos(data_dir: Path = DATA_DIR) -> str:
+    """Huella de los Excel de data/ (ruta relativa + tamaño). Si se agrega, quita o cambia
+    un archivo, la huella cambia y la app sabe que el Parquet curado quedó viejo."""
+    data_dir = Path(data_dir)
+    items = sorted(f"{f.relative_to(data_dir).as_posix()}|{f.stat().st_size}" for f in data_dir.rglob("*.xlsx"))
+    return hashlib.md5("\n".join(items).encode()).hexdigest()
+
+
 def _carpeta_de(materia: str, data_dir: Path) -> Path | None:
     for p in data_dir.iterdir():
         if p.is_dir() and norm(p.name) == norm(materia):

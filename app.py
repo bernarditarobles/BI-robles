@@ -21,7 +21,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 from tfi_bi import metrics as M  # noqa: E402
 from tfi_bi import sql_kpis as S  # noqa: E402
 from tfi_bi.config import COLORES_CONDICION, CURADO_DIR, DATA_DIR, norm, schema_de  # noqa: E402
-from tfi_bi.loaders import cargar_datos  # noqa: E402
+from tfi_bi.loaders import cargar_datos, firma_datos  # noqa: E402
+
+# Reglas de cálculo fijas (criterio de clase, explicadas en el informe):
+# las evaluaciones no rendidas no cuentan y Álgebra se compara en % normalizado (puntos / puntos posibles).
+ausentes_cero = False
+base_algebra = "normalizado"
 
 st.set_page_config(page_title="TFI · Seguimiento académico LMS", page_icon="📊", layout="wide")
 
@@ -33,6 +38,27 @@ COL_SIT = {
     "No matriculado con actividad": "#7b3fbf", "Baja con actividad": "#e07b39",
     "No matriculado sin actividad": "#c9d1d9", "Baja sin actividad": "#9aa5b1",
 }
+NOMBRES = {
+    "nombre_completo": "Alumno", "id": "ID", "materia": "Asignatura", "sesiones": "Sesiones", "horas": "Horas",
+    "dias_activos": "Días activos", "ultima": "Última actividad", "estado_actividad": "Actividad",
+    "pct_final": "Nota (0-100)", "condicion": "Condición", "dias_desde_ultima": "Días sin entrar",
+    "grupo_riesgo": "Grupo", "estado_insc": "Inscripción", "eventos": "Interacciones",
+    "situacion_matricula": "Situación",
+}
+
+
+def legible(df: pd.DataFrame) -> pd.DataFrame:
+    """Tabla para mostrar: tiempo en horas, nota y fechas redondeadas, nombres de columna en castellano."""
+    df = df.copy()
+    if "tiempo_min" in df:
+        df.insert(df.columns.get_loc("tiempo_min"), "horas", (df.pop("tiempo_min") / 60).round(1))
+    if "pct_final" in df:
+        df["pct_final"] = df["pct_final"].round(1)
+    if "ultima" in df:
+        df["ultima"] = pd.to_datetime(df["ultima"]).dt.strftime("%d/%m/%Y %H:%M")
+    return df.rename(columns=NOMBRES)
+
+
 TABLAS = ["matriculados", "participacion", "trazabilidad", "calificaciones", "log_limpieza"]
 
 
@@ -42,9 +68,12 @@ BASE = Path(__file__).resolve().parent
 
 
 @st.cache_data(show_spinner="Cargando datos del LMS…")
-def cargar():
-    """Capa curada (Parquet) si existe; si no, procesa los Excel de data/."""
-    if all((CURADO_DIR / f"{t}.parquet").exists() for t in TABLAS):
+def cargar(firma: str):
+    """Capa curada (Parquet) si está al día con los Excel de data/; si no, procesa los Excel.
+    `firma` es la huella de data/: si el profe suma un archivo, cambia y se reprocesa solo."""
+    archivo_firma = CURADO_DIR / "firma_datos.txt"
+    al_dia = archivo_firma.exists() and archivo_firma.read_text().strip() == firma
+    if al_dia and all((CURADO_DIR / f"{t}.parquet").exists() for t in TABLAS):
         d = {t: pd.read_parquet(CURADO_DIR / f"{t}.parquet") for t in TABLAS}
     else:
         d = cargar_datos(DATA_DIR, verbose=False)
@@ -97,7 +126,7 @@ if subido is not None:
     except Exception as e:  # noqa: BLE001
         st.sidebar.error(f"No pude procesar el zip: {e}")
 if p is None:
-    p = cargar()
+    p = cargar(firma_datos(DATA_DIR))
 f_min, f_max = M.fecha_minima(p).date(), M.fecha_maxima(p).date()
 materias_all = sorted(p["matriculados"]["materia"].unique())
 
@@ -107,14 +136,7 @@ with st.sidebar:
     corte = st.date_input("📅 Fecha de corte", value=f_max, min_value=f_min, max_value=f_max,
                           help="Todas las métricas se calculan con lo ocurrido hasta esta fecha (inclusive).")
     materias = st.multiselect("Asignaturas", materias_all, default=materias_all)
-    ambito = st.radio("Ámbito de los KPIs de notas", ["Solo matriculados", "Todos los alumnos del aula"],
-                      help="Los oyentes (no inscriptos que cursan) se incluyen solo si elegís la 2ª opción.")
     dias_inact = st.slider("Días sin ingresar para considerar 'inactivo'", 7, 60, 14)
-    st.subheader("Reglas de cálculo")
-    ausentes_cero = st.checkbox("Evaluaciones no rendidas cuentan como 0", value=False,
-                                help="Por defecto se promedian solo las evaluaciones rendidas (criterio visto en clase).")
-    base_algebra = st.radio("Álgebra: comparar umbrales (60/85) contra", ["normalizado", "puntos"],
-                            format_func=lambda x: "% normalizado a 100" if x == "normalizado" else "puntos acumulados (de 120)")
     st.caption("Las notas no traen fecha: se fechan con el primer 'Realizar evaluación' del alumno en la trazabilidad.")
 
 if not materias:
@@ -123,11 +145,11 @@ if not materias:
 
 est_all = tabla(p, origen, pd.Timestamp(corte), dias_inact, ausentes_cero, base_algebra)
 est_all = est_all[est_all["materia"].isin(materias)]
-est = est_all[est_all["matriculado"]] if ambito == "Solo matriculados" else est_all
+est = est_all[est_all["matriculado"]]  # los KPIs se calculan sobre matriculados; los no inscriptos van en Matrícula y alertas
 if est_all.empty or est.empty:
     st.warning("No hay alumnos para los filtros seleccionados.")  # control de estado vacío (Clase 9, paso 6)
     st.stop()
-solo = ambito == "Solo matriculados"
+solo = True
 kp = S.kpis_por_materia(est_all, solo)  # SQL analítico con DuckDB
 corte_prev = pd.Timestamp(corte) - pd.Timedelta(days=7)
 kp_prev = None
@@ -136,10 +158,10 @@ if corte_prev.date() >= f_min:  # delta contra 7 días antes de la fecha de cort
     kp_prev = S.kpis_por_materia(e_prev[e_prev["materia"].isin(materias)], solo).set_index("materia")
 
 st.title("📊 Seguimiento académico LMS")
-st.caption(f"Datos hasta el **{pd.Timestamp(corte):%d/%m/%Y}** · {len(materias)} asignatura(s) · ámbito: {ambito.lower()}")
+st.caption(f"Datos hasta el **{pd.Timestamp(corte):%d/%m/%Y}** · {len(materias)} asignatura(s) · KPIs sobre matriculados")
 
 tabs = st.tabs(["1 · General", "2 · Participación", "3 · Trazabilidad", "4 · Rendimiento",
-                "5 · Notas vs Participación", "6 · Ficha individual", "7 · Matrícula y alertas", "Explorador de datos"])
+                "5 · Notas vs Participación", "6 · Ficha individual", "7 · Matrícula y alertas"])
 
 
 def fmt(v, dec=1, suf=""):
@@ -189,9 +211,9 @@ with tabs[0]:
         st.dataframe(kp.rename(columns={
             "materia": "Asignatura", "matriculados": "Matriculados", "alumnos_en_aula": "Alumnos en aula",
             "activos": "Activos", "inactivos": "Inactivos", "pct_activos": "% activos",
-            "sesiones_prom": "Sesiones prom.", "horas_prom": "Horas prom.", "avance_prom": "Avance prom. (%)",
-            "nota_prom": "Nota prom. (0-100)", "pct_promociona": "% promociona", "pct_regular": "% regular",
-            "pct_libre": "% libre", "no_inscriptos_activos": "No inscriptos activos"}).round(1),
+            "horas_prom": "Horas prom.", "nota_prom": "Nota prom. (0-100)", "pct_promociona": "% promociona",
+            "pct_regular": "% regular", "pct_libre": "% libre", "no_inscriptos_activos": "No inscriptos activos"})
+            .drop(columns=["sesiones_prom", "avance_prom"]).round(1),
             width="stretch", hide_index=True)
 
 # ================================================================= 2 PARTICIPACIÓN
@@ -222,11 +244,13 @@ with tabs[1]:
                                      title="Cobertura: % de avance en el aula (reporte LMS)"), width="stretch")
         st.caption("El avance proviene del reporte de participación (exportado el 24/10) y no se recalcula por fecha de corte.")
     st.markdown("**Alumnos más y menos activos** (por tiempo estimado de uso)")
-    cols_t = ["nombre_completo", "id", "materia", "sesiones", "tiempo_min", "dias_activos", "ultima", "estado_actividad"]
+    cols_t = ["nombre_completo", "materia", "sesiones", "tiempo_min", "ultima"]
     base = est[est["con_actividad"]][cols_t].sort_values("tiempo_min")
     x, y = st.columns(2)
-    x.dataframe(base.tail(10).iloc[::-1], hide_index=True, width="stretch")
-    y.dataframe(base.head(10), hide_index=True, width="stretch")
+    x.markdown("Los 10 con más horas")
+    x.dataframe(legible(base.tail(10).iloc[::-1]), hide_index=True, width="stretch")
+    y.markdown("Los 10 con menos horas (posible abandono)")
+    y.dataframe(legible(base.head(10)), hide_index=True, width="stretch")
 
 # ================================================================= 3 TRAZABILIDAD
 with tabs[2]:
@@ -271,9 +295,8 @@ with tabs[3]:
                + (f" · máx. {sc['max_total']} pts" if sc["modo"] == "acumulativo" else ""))
     _, cal = M.calificaciones_resumen(p, pd.Timestamp(corte), ausentes_cero, base_algebra)
     cal = cal[cal["materia"] == mat_r]
-    if ambito == "Solo matriculados":
-        ids_ok = set(est_all[est_all["matriculado"] & (est_all["materia"] == mat_r)]["id"])
-        cal = cal[cal["id"].isin(ids_ok)]
+    ids_ok = set(est_all[est_all["matriculado"] & (est_all["materia"] == mat_r)]["id"])
+    cal = cal[cal["id"].isin(ids_ok)]
     a, b = st.columns(2)
     with a:
         fig = px.box(cal, x="instrumento", y="pct", points="outliers",
@@ -310,7 +333,9 @@ with tabs[4]:
                      format_func={"tiempo_min": "Tiempo de conexión (min)", "sesiones": "Sesiones",
                                   "eventos": "Interacciones", "avance_pct": "Avance (%)"}.get)
     fig = px.scatter(d5, x=x_var, y="pct_final", color="grupo_riesgo", facet_col="materia",
-                     hover_data=["nombre_completo", "id", "condicion"], title="Participación vs nota final")
+                     hover_data=["nombre_completo", "id", "condicion"], title="Participación vs nota final",
+                     labels={"tiempo_min": "Tiempo (min)", "sesiones": "Sesiones", "eventos": "Interacciones",
+                             "avance_pct": "Avance (%)", "pct_final": "Nota (0-100)", "grupo_riesgo": "Grupo"})
     for m in d5["materia"].unique():
         h = d5[d5["materia"] == m][[x_var, "pct_final"]].dropna()
         if len(h) > 5 and h[x_var].nunique() > 1:
@@ -324,8 +349,12 @@ with tabs[4]:
     a, b = st.columns([3, 2])
     with a:
         st.markdown("**Correlación con la nota final**")
-        st.dataframe(cr.round(3), hide_index=True, width="stretch")
-        st.caption("Pearson mide relación lineal, Spearman relación de orden. Con p ≥ 0,05 la relación no es estadísticamente distinguible de cero.")
+        tabla_r = pd.DataFrame({
+            "Asignatura": cr["materia"], "Medida": cr["variable"], "Alumnos": cr["n"],
+            "r de Pearson": cr["pearson"].round(2),
+            "¿Significativa? (p < 0,05)": np.where(cr["p_valor"] < 0.05, "Sí", "No")})
+        st.dataframe(tabla_r, hide_index=True, width="stretch")
+        st.caption("r va de -1 a 1: cerca de 0 es sin relación. 'Sí' quiere decir que la relación no se explica por azar.")
     with b:
         g = d5.groupby(["materia", "grupo_riesgo"]).size().reset_index(name="alumnos")
         st.plotly_chart(px.bar(g, x="alumnos", y="materia", color="grupo_riesgo", orientation="h",
@@ -333,7 +362,7 @@ with tabs[4]:
     riesgo = d5[d5["grupo_riesgo"].str.startswith(("Riesgo", "Participa"))][
         ["nombre_completo", "id", "materia", "pct_final", "condicion", "tiempo_min", "sesiones", "dias_desde_ultima", "grupo_riesgo"]]
     st.markdown(f"**Alumnos en riesgo ({len(riesgo)})**")
-    st.dataframe(riesgo.sort_values("pct_final"), hide_index=True, width="stretch")
+    st.dataframe(legible(riesgo.sort_values("pct_final")), hide_index=True, width="stretch")
 
 # ==================================================================== 6 INDIVIDUAL
 with tabs[5]:
@@ -397,29 +426,10 @@ with tabs[6]:
     st.markdown("### 🚨 No matriculados pero cursando")
     al = est_all[est_all["alerta_no_inscripto"]][
         ["materia", "id", "nombre_completo", "estado_insc", "eventos", "sesiones", "ultima", "pct_final", "condicion"]]
-    st.dataframe(al.sort_values(["materia", "eventos"], ascending=[True, False]), hide_index=True, width="stretch")
+    st.dataframe(legible(al.sort_values(["materia", "eventos"], ascending=[True, False])), hide_index=True, width="stretch")
     st.download_button("Descargar alertas (CSV)", al.to_csv(index=False).encode("utf-8"), "alertas_no_inscriptos.csv", "text/csv")
     st.markdown("### Matriculados sin participación reciente")
     sp = est_all[est_all["situacion_matricula"].isin(["Matriculado sin actividad", "Matriculado inactivo"])][
         ["materia", "id", "nombre_completo", "situacion_matricula", "dias_desde_ultima", "eventos", "ultima"]]
-    st.dataframe(sp.sort_values("dias_desde_ultima", ascending=False), hide_index=True, width="stretch")
+    st.dataframe(legible(sp.sort_values("dias_desde_ultima", ascending=False)), hide_index=True, width="stretch")
     st.download_button("Descargar (CSV)", sp.to_csv(index=False).encode("utf-8"), "matriculados_sin_participacion.csv", "text/csv")
-
-# ============================================================== EXPLORADOR DE DATOS
-with tabs[7]:
-    st.subheader("Explorador de datos")
-    c1, c2 = st.columns(2)
-    cond_f = c1.multiselect("Condición final", ORDEN_COND, default=ORDEN_COND, key="cond_exp")
-    sits = sorted(est_all["situacion_matricula"].unique())
-    sit_f = c2.multiselect("Situación de matrícula", sits, default=sits, key="sit_exp")
-    cols_e = ["materia", "id", "nombre_completo", "situacion_matricula", "estado_actividad", "condicion", "pct_final",
-              "puntos", "instrumentos_rendidos", "sesiones", "tiempo_min", "eventos", "avance_pct", "ultima",
-              "dias_desde_ultima", "grupo_riesgo"]
-    ex = est_all[est_all["condicion"].isin(cond_f) & est_all["situacion_matricula"].isin(sit_f)][cols_e]
-    if ex.empty:
-        st.warning("No hay registros para los filtros seleccionados.")
-    else:
-        st.caption(f"{len(ex):,} registros")
-        st.dataframe(ex, width="stretch", hide_index=True)
-        st.download_button("Descargar datos filtrados en CSV", ex.to_csv(index=False).encode("utf-8"),
-                           "seguimiento_filtrado.csv", "text/csv")
