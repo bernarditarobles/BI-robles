@@ -2,6 +2,8 @@
 
 Dashboard en Streamlit para el seguimiento de alumnos de tres asignaturas (Álgebra, Algoritmos y Estructuras de Datos, y Probabilidad y Estadística) a partir de los reportes anonimizados del LMS: matrícula, participación, trazabilidad y calificaciones.
 
+El proyecto se desarrolló y se probó en local. El repositorio se subió completo al final para la entrega, por eso el historial tiene pocos commits.
+
 ## Cómo correrlo
 
 ```bash
